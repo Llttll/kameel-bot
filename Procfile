@@ -1,0 +1,1 @@
+worker: python kameel_bot.py
