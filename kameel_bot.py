@@ -4,6 +4,8 @@
 Security Department Telegram Bot
 """
 
+import json
+import os
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -14,11 +16,54 @@ from telegram.ext import (
     ConversationHandler,
     filters,
     ContextTypes,
+    ApplicationHandlerStop,
 )
 
 # ─── الإعدادات ────────────────────────────────────────────────────────────────
 BOT_TOKEN = "8478999240:AAGHK7aSH2rz_3doNM6uJLStfXxRUWICe1c"   # ← ضع توكن البوت هنا
-ADMIN_CHAT_ID = 38866499                 # ← ضع معرّف الإدمن لاستقبال الطلبات (اختياري)
+ADMINS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admins.json")
+
+# ─── إدارة الإدمنات (متعدد) ──────────────────────────────────────────────────
+def load_admins() -> set:
+    """تحميل قائمة الإدمنات من الملف."""
+    if os.path.exists(ADMINS_FILE):
+        try:
+            with open(ADMINS_FILE, "r") as f:
+                return set(json.load(f))
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return set()
+
+def save_admins(admins: set):
+    """حفظ قائمة الإدمنات إلى الملف."""
+    with open(ADMINS_FILE, "w") as f:
+        json.dump(list(admins), f)
+
+def is_admin(user_id: int) -> bool:
+    """التحقق هل المستخدم إدمن."""
+    return user_id in load_admins()
+
+# الإدمن الأصلي (الرئيسي) — لا يمكن حذفه
+MASTER_ADMIN_ID = 38866499
+
+# تأكد من وجود الإدمن الرئيسي في الملف عند بدء التشغيل
+def init_admins():
+    admins = load_admins()
+    if MASTER_ADMIN_ID not in admins:
+        admins.add(MASTER_ADMIN_ID)
+        save_admins(admins)
+
+# ─── تتبع الرسائل للرد ──────────────────────────────────────────────────────
+# قاموس: { (admin_chat_id, admin_msg_id): user_chat_id }
+# يربط رسالة الإشعار المُرسلة للإدمن بمعرّف المستخدم الأصلي
+message_to_user_map: dict[tuple[int, int], int] = {}
+
+# ─── تتبع المحادثات المباشرة ─────────────────────────────────────────────────
+# قاموس: { user_chat_id: True } — المستخدمون الذين هم حالياً في محادثة مباشرة
+active_chats: dict[int, bool] = {}
+
+# مرجع للـ ConversationHandler لتغيير حالة المستخدم برمجياً
+conv_handler: ConversationHandler | None = None
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -73,6 +118,11 @@ def kb_back():
         [InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="home")]
     ])
 
+def kb_end_chat():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔚 إنهاء المحادثة", callback_data="end_chat")]
+    ])
+
 def kb_vauth():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄  تجديد",          callback_data="va_تجديد")],
@@ -94,21 +144,36 @@ async def send_or_edit(update: Update, text: str, markup=None):
             text, reply_markup=markup, parse_mode="Markdown"
         )
 
-# ─── مساعد: إشعار الإدمن ────────────────────────────────────────────────────
-async def notify_admin(context: ContextTypes.DEFAULT_TYPE, user, text: str):
-    if not ADMIN_CHAT_ID:
+# ─── مساعد: إشعار جميع الإدمنات ──────────────────────────────────────────────
+async def notify_admins(context: ContextTypes.DEFAULT_TYPE, user, text: str):
+    """إرسال إشعار لجميع الإدمنات وتتبع الرسائل للرد."""
+    admins = load_admins()
+    if not admins:
         return
-    try:
-        mention = f"@{user.username}" if user.username else user.first_name
-        msg = f"🔔 *طلب جديد* من {mention} (ID: `{user.id}`)\n\n{text}"
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=msg, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Admin notify failed: {e}")
+    mention = f"@{user.username}" if user.username else user.first_name
+    msg = (
+        f"🔔 *طلب جديد* من {mention} (ID: `{user.id}`)\n\n"
+        f"{text}\n\n"
+        f"💬 _للرد على المستخدم، قم بالرد على هذه الرسالة (Reply)_"
+    )
+    for admin_id in admins:
+        try:
+            sent = await context.bot.send_message(
+                chat_id=admin_id, text=msg, parse_mode="Markdown"
+            )
+            # تخزين الربط: رسالة الإشعار ← المستخدم الأصلي
+            message_to_user_map[(admin_id, sent.message_id)] = user.id
+        except Exception as e:
+            logger.error(f"Admin notify failed for {admin_id}: {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # شاشة البداية
 # ═══════════════════════════════════════════════════════════════════════════════
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # إزالة المستخدم من المحادثات المباشرة عند العودة للقائمة
+    user_id = update.effective_user.id
+    if user_id in active_chats:
+        del active_chats[user_id]
     context.user_data.clear()
     await send_or_edit(update, WELCOME, kb_main())
     return MAIN_MENU
@@ -199,7 +264,7 @@ async def badge_problem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         f"{DIVIDER}\n📩 سيتم التواصل معك في أقرب وقت ممكن 🫡"
     )
     await update.message.reply_text(summary, reply_markup=kb_back(), parse_mode="Markdown")
-    await notify_admin(context, update.effective_user, summary)
+    await notify_admins(context, update.effective_user, summary)
     return MAIN_MENU
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -261,7 +326,7 @@ async def va_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"{DIVIDER}\n📩 سيتم التواصل معك في أقرب وقت ممكن 🫡"
     )
     await update.message.reply_text(summary, reply_markup=kb_back(), parse_mode="Markdown")
-    await notify_admin(context, update.effective_user, summary)
+    await notify_admins(context, update.effective_user, summary)
     return MAIN_MENU
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -314,7 +379,7 @@ async def tg_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"{DIVIDER}\n📩 سيتم التواصل معك في أقرب وقت ممكن 🫡"
     )
     await update.message.reply_text(summary, reply_markup=kb_back(), parse_mode="Markdown")
-    await notify_admin(context, update.effective_user, summary)
+    await notify_admins(context, update.effective_user, summary)
     return MAIN_MENU
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -329,7 +394,7 @@ async def suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=kb_back(),
         parse_mode="Markdown",
     )
-    await notify_admin(
+    await notify_admins(
         context,
         update.effective_user,
         f"💡 *مقترح / مشكلة:*\n{DIVIDER}\n{text}",
@@ -343,12 +408,289 @@ async def go_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return await start(update, context)
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# المحادثة المباشرة — رسائل المستخدم للإدمن
+# ═══════════════════════════════════════════════════════════════════════════════
+async def live_chat_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    في وضع المحادثة المباشرة: يُرسل كل ما يكتبه المستخدم إلى جميع الإدمنات.
+    """
+    user = update.effective_user
+    user_msg = update.message.text
+    mention = f"@{user.username}" if user.username else user.first_name
+
+    admin_text = (
+        f"💬 *محادثة مباشرة* من {mention} (ID: `{user.id}`):\n"
+        f"{DIVIDER}\n\n"
+        f"{user_msg}\n\n"
+        f"{DIVIDER}\n"
+        f"↩️ _للرد، قم بالرد على هذه الرسالة (Reply)_\n"
+        f"🔚 _لإنهاء المحادثة: /end `{user.id}`_"
+    )
+
+    admins = load_admins()
+    for admin_id in admins:
+        try:
+            sent = await context.bot.send_message(
+                chat_id=admin_id, text=admin_text, parse_mode="Markdown"
+            )
+            message_to_user_map[(admin_id, sent.message_id)] = user.id
+        except Exception as e:
+            logger.error(f"Live chat forward to admin {admin_id} failed: {e}")
+
+async def intercept_live_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يعترض رسائل المستخدم إذا كان في محادثة مباشرة."""
+    if update.effective_user and update.effective_user.id in active_chats:
+        await live_chat_user(update, context)
+        raise ApplicationHandlerStop
+
+async def end_chat_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عند ضغط المستخدم زر إنهاء المحادثة."""
+    q = update.callback_query
+    await q.answer()
+    user_id = update.effective_user.id
+    if user_id in active_chats:
+        del active_chats[user_id]
+    # إبلاغ الإدمنات
+    admins = load_admins()
+    mention = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
+    for admin_id in admins:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=f"🔚 *{mention}* (ID: `{user_id}`) أنهى المحادثة المباشرة.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+    
+    await q.edit_message_text("🔚 *تم إنهاء المحادثة المباشرة.*", parse_mode="Markdown")
+    raise ApplicationHandlerStop
+
+async def cmd_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    أمر /end — يستخدمه المستخدم لإنهاء المحادثة المباشرة.
+    أو الإدمن لإنهاء محادثة مستخدم معين: /end <user_id>
+    """
+    user_id = update.effective_user.id
+
+    # إذا كان المرسل إدمن مع معرّف مستخدم
+    if is_admin(user_id) and context.args:
+        try:
+            target_user_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ الرجاء إدخال رقم صحيح.")
+            return
+
+        if target_user_id in active_chats:
+            del active_chats[target_user_id]
+            try:
+                await context.bot.send_message(
+                    chat_id=target_user_id,
+                    text=(
+                        f"🔚 *تم إنهاء المحادثة المباشرة من قبل المسؤول.*\n\n"
+                        f"شكراً لتواصلك معنا 🫡\n"
+                        f"أرسل /start للعودة للقائمة الرئيسية."
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+            await update.message.reply_text(
+                f"✅ تم إنهاء المحادثة مع المستخدم `{target_user_id}`.",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                f"ℹ️ المستخدم `{target_user_id}` ليس في محادثة مباشرة حالياً.",
+                parse_mode="Markdown",
+            )
+        return
+
+    # إذا كان المرسل مستخدم عادي في محادثة مباشرة
+    if user_id in active_chats:
+        del active_chats[user_id]
+        # إبلاغ الإدمنات
+        admins = load_admins()
+        mention = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
+        for admin_id in admins:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"🔚 *{mention}* (ID: `{user_id}`) أنهى المحادثة المباشرة.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+        await update.message.reply_text(
+            "🔚 *تم إنهاء المحادثة المباشرة.*\n\n"
+            "شكراً لتواصلك معنا 🫡\n"
+            "أرسل /start للعودة للقائمة الرئيسية.",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            "ℹ️ لا توجد محادثة مباشرة حالياً.\n"
+            "أرسل /start للعودة للقائمة الرئيسية.",
+        )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# أوامر إدارة الإدمنات
+# ═══════════════════════════════════════════════════════════════════════════════
+async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إضافة إدمن جديد. الاستخدام: /addadmin <chat_id>"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ ليس لديك صلاحية لهذا الأمر.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "❌ الاستخدام: `/addadmin <chat_id>`\n\n"
+            "💡 يمكن للإدمن الجديد معرفة الـ chat\_id عن طريق إرسال `/myid` للبوت.",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        new_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ الرجاء إدخال رقم صحيح.")
+        return
+    admins = load_admins()
+    if new_id in admins:
+        await update.message.reply_text(f"ℹ️ المستخدم `{new_id}` إدمن بالفعل.", parse_mode="Markdown")
+        return
+    admins.add(new_id)
+    save_admins(admins)
+    await update.message.reply_text(f"✅ تمت إضافة الإدمن `{new_id}` بنجاح.", parse_mode="Markdown")
+    logger.info(f"Admin {user_id} added new admin {new_id}")
+
+async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف إدمن. الاستخدام: /removeadmin <chat_id>"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ ليس لديك صلاحية لهذا الأمر.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "❌ الاستخدام: `/removeadmin <chat_id>`",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ الرجاء إدخال رقم صحيح.")
+        return
+    if target_id == MASTER_ADMIN_ID:
+        await update.message.reply_text("⛔ لا يمكن حذف الإدمن الرئيسي.")
+        return
+    admins = load_admins()
+    if target_id not in admins:
+        await update.message.reply_text(f"ℹ️ المستخدم `{target_id}` ليس إدمناً.", parse_mode="Markdown")
+        return
+    admins.discard(target_id)
+    save_admins(admins)
+    await update.message.reply_text(f"✅ تم حذف الإدمن `{target_id}` بنجاح.", parse_mode="Markdown")
+    logger.info(f"Admin {user_id} removed admin {target_id}")
+
+async def cmd_listadmins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض قائمة الإدمنات."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ ليس لديك صلاحية لهذا الأمر.")
+        return
+    admins = load_admins()
+    if not admins:
+        await update.message.reply_text("📋 لا يوجد إدمنات حالياً.")
+        return
+    lines = ["👥 *قائمة الإدمنات:*\n"]
+    for i, aid in enumerate(sorted(admins), 1):
+        master = " 👑" if aid == MASTER_ADMIN_ID else ""
+        lines.append(f"{i}. `{aid}`{master}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إرسال معرّف المستخدم (chat_id)."""
+    await update.message.reply_text(
+        f"🆔 معرّفك (Chat ID): `{update.effective_user.id}`",
+        parse_mode="Markdown",
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# رد الإدمن على المستخدم (+ تفعيل المحادثة المباشرة)
+# ═══════════════════════════════════════════════════════════════════════════════
+async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    عندما يرد الإدمن (Reply) على رسالة إشعار، يتم إرسال الرد للمستخدم الأصلي
+    ويدخل المستخدم في وضع المحادثة المباشرة تلقائياً.
+    """
+    msg = update.message
+    admin_id = update.effective_user.id
+
+    # تحقق أن المرسل إدمن
+    if not is_admin(admin_id):
+        return
+
+    # تحقق أن الرسالة هي رد على رسالة أخرى
+    if not msg.reply_to_message:
+        return
+
+    replied_msg_id = msg.reply_to_message.message_id
+    key = (admin_id, replied_msg_id)
+
+    # ابحث عن المستخدم الأصلي
+    user_chat_id = message_to_user_map.get(key)
+    if not user_chat_id:
+        return
+
+    # تفعيل المحادثة المباشرة للمستخدم
+    is_new_chat = user_chat_id not in active_chats
+    active_chats[user_chat_id] = True
+
+    try:
+        if is_new_chat:
+            # أول رد — أبلغ المستخدم أنه دخل في محادثة مباشرة
+            chat_start_text = (
+                f"📬 *رد من قسم الأمن:*\n{DIVIDER}\n\n"
+                f"{msg.text}\n\n"
+                f"{DIVIDER}\n"
+                f"💬 *أنت الآن في محادثة مباشرة مع المسؤول*\n"
+                f"اكتب ردك مباشرة وسيصل للمسؤول فوراً 👇\n\n"
+                f"🔚 _لإنهاء المحادثة أرسل /end_"
+            )
+            await context.bot.send_message(
+                chat_id=user_chat_id, text=chat_start_text,
+                parse_mode="Markdown", reply_markup=kb_end_chat(),
+            )
+        else:
+            # محادثة جارية — أرسل الرد فقط
+            reply_text = (
+                f"📬 *المسؤول:*\n{DIVIDER}\n\n"
+                f"{msg.text}"
+            )
+            await context.bot.send_message(
+                chat_id=user_chat_id, text=reply_text, parse_mode="Markdown",
+            )
+
+        await msg.reply_text("✅ تم إرسال ردك للمستخدم بنجاح.")
+        logger.info(f"Admin {admin_id} replied to user {user_chat_id} (live_chat={not is_new_chat})")
+    except Exception as e:
+        await msg.reply_text(f"❌ فشل إرسال الرد: {e}")
+        logger.error(f"Reply to user {user_chat_id} failed: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # التشغيل الرئيسي
 # ═══════════════════════════════════════════════════════════════════════════════
 def main() -> None:
+    # تهيئة ملف الإدمنات
+    init_admins()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     txt = filters.TEXT & ~filters.COMMAND
+
+    # ── معترض المحادثة المباشرة (مجموعة -1 ليعمل قبل ConversationHandler) ──
+    app.add_handler(MessageHandler(txt, intercept_live_chat), group=-1)
+    app.add_handler(CallbackQueryHandler(end_chat_button, pattern=r"^end_chat$"), group=-1)
 
     conv = ConversationHandler(
         per_message=False,
@@ -381,12 +723,33 @@ def main() -> None:
         },
         fallbacks=[
             CommandHandler("start", start),
+            CommandHandler("end", cmd_end),
             CallbackQueryHandler(go_home, pattern=r"^home$"),
         ],
         allow_reentry=True,
     )
 
+    # تخزين مرجع ConversationHandler للاستخدام في admin_reply
+    global conv_handler
+    conv_handler = conv
+
     app.add_handler(conv)
+
+    # ── أوامر عامة ───────────────────────────────────────────────
+    app.add_handler(CommandHandler("end", cmd_end))
+
+    # ── أوامر إدارة الإدمنات ───────────────────────────────────────────────
+    app.add_handler(CommandHandler("addadmin", cmd_addadmin))
+    app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
+    app.add_handler(CommandHandler("listadmins", cmd_listadmins))
+    app.add_handler(CommandHandler("myid", cmd_myid))
+
+    # ── معالج رد الإدمن على المستخدم ──────────────────────────────────────
+    # يلتقط أي رسالة نصية تكون رداً (reply) من إدمن
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.REPLY,
+        admin_reply,
+    ))
 
     print("[Kameel Bot] Running and polling for updates...", flush=True)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
