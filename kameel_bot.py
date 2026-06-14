@@ -22,6 +22,41 @@ from telegram.ext import (
 # ─── الإعدادات ────────────────────────────────────────────────────────────────
 BOT_TOKEN = "8478999240:AAGHK7aSH2rz_3doNM6uJLStfXxRUWICe1c"   # ← ضع توكن البوت هنا
 ADMINS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admins.json")
+SERIAL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "serial.json")
+
+def get_next_serial() -> int:
+    serial = 0
+    if os.path.exists(SERIAL_FILE):
+        try:
+            with open(SERIAL_FILE, "r") as f:
+                data = json.load(f)
+                serial = data.get("last_serial", 0)
+        except Exception:
+            pass
+    serial += 1
+    try:
+        with open(SERIAL_FILE, "w") as f:
+            json.dump({"last_serial": serial}, f)
+    except Exception as e:
+        logger.error(f"Failed to save serial: {e}")
+    return serial
+
+def get_msg_content(msg) -> str:
+    if msg.text:
+        return msg.text
+    elif msg.caption:
+        return msg.caption
+    elif msg.photo:
+        return "صورة 🖼️"
+    elif msg.voice:
+        return "بصمة صوتية 🎤"
+    elif msg.video:
+        return "فيديو 🎬"
+    elif msg.document:
+        return "ملف 📄"
+    elif msg.audio:
+        return "مقطع صوتي 🎵"
+    return "مرفق 📎"
 
 # ─── إدارة الإدمنات (متعدد) ──────────────────────────────────────────────────
 def load_admins() -> set:
@@ -54,13 +89,13 @@ def init_admins():
         save_admins(admins)
 
 # ─── تتبع الرسائل للرد ──────────────────────────────────────────────────────
-# قاموس: { (admin_chat_id, admin_msg_id): user_chat_id }
-# يربط رسالة الإشعار المُرسلة للإدمن بمعرّف المستخدم الأصلي
-message_to_user_map: dict[tuple[int, int], int] = {}
+# قاموس: { (admin_chat_id, admin_msg_id): (user_chat_id, serial) }
+# يربط رسالة الإشعار المُرسلة للإدمن بمعرّف المستخدم الأصلي ورقم الطلب
+message_to_user_map: dict[tuple[int, int], tuple[int, int|None]] = {}
 
 # ─── تتبع المحادثات المباشرة ─────────────────────────────────────────────────
-# قاموس: { user_chat_id: True } — المستخدمون الذين هم حالياً في محادثة مباشرة
-active_chats: dict[int, bool] = {}
+# قاموس: { user_chat_id: serial_number } — المستخدمون الذين هم حالياً في محادثة مباشرة
+active_chats: dict[int, int|bool] = {}
 
 # مرجع للـ ConversationHandler لتغيير حالة المستخدم برمجياً
 conv_handler: ConversationHandler | None = None
@@ -145,14 +180,15 @@ async def send_or_edit(update: Update, text: str, markup=None):
         )
 
 # ─── مساعد: إشعار جميع الإدمنات ──────────────────────────────────────────────
-async def notify_admins(context: ContextTypes.DEFAULT_TYPE, user, text: str):
+async def notify_admins(context: ContextTypes.DEFAULT_TYPE, user, text: str, forward_msg_ids: list = None, serial: int = None):
     """إرسال إشعار لجميع الإدمنات وتتبع الرسائل للرد."""
     admins = load_admins()
     if not admins:
         return
     mention = f"@{user.username}" if user.username else user.first_name
+    serial_text = f" [طلب #{serial}]" if serial else ""
     msg = (
-        f"🔔 *طلب جديد* من {mention} (ID: `{user.id}`)\n\n"
+        f"🔔 *طلب جديد*{serial_text} من {mention} (ID: `{user.id}`)\n\n"
         f"{text}\n\n"
         f"💬 _للرد على المستخدم، قم بالرد على هذه الرسالة (Reply)_"
     )
@@ -162,7 +198,20 @@ async def notify_admins(context: ContextTypes.DEFAULT_TYPE, user, text: str):
                 chat_id=admin_id, text=msg, parse_mode="Markdown"
             )
             # تخزين الربط: رسالة الإشعار ← المستخدم الأصلي
-            message_to_user_map[(admin_id, sent.message_id)] = user.id
+            message_to_user_map[(admin_id, sent.message_id)] = (user.id, serial)
+            
+            # إرسال المرفقات إن وجدت
+            if forward_msg_ids:
+                for f_msg_id in forward_msg_ids:
+                    try:
+                        sent_fwd = await context.bot.copy_message(
+                            chat_id=admin_id,
+                            from_chat_id=user.id,
+                            message_id=f_msg_id
+                        )
+                        message_to_user_map[(admin_id, sent_fwd.message_id)] = (user.id, serial)
+                    except Exception as e:
+                        logger.error(f"Failed to copy media msg {f_msg_id} to {admin_id}: {e}")
         except Exception as e:
             logger.error(f"Admin notify failed for {admin_id}: {e}")
 
@@ -184,6 +233,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
+
+    context.user_data.pop("media_msgs", None)
 
     match q.data:
         case "badge":
@@ -227,7 +278,9 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # نموذج الباج
 # ═══════════════════════════════════════════════════════════════════════════════
 async def badge_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["b_name"] = update.message.text
+    context.user_data["b_name"] = get_msg_content(update.message)
+    if not update.message.text:
+        context.user_data.setdefault("media_msgs", []).append(update.message.message_id)
     await update.message.reply_text(
         "✅ تم.\n\n*2️⃣  الرقم العسكري:*\nأرسل رقمك العسكري 👇",
         parse_mode="Markdown",
@@ -235,7 +288,9 @@ async def badge_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return BADGE_MIL_NUM
 
 async def badge_mil_num(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["b_mil"] = update.message.text
+    context.user_data["b_mil"] = get_msg_content(update.message)
+    if not update.message.text:
+        context.user_data.setdefault("media_msgs", []).append(update.message.message_id)
     await update.message.reply_text(
         "✅ تم.\n\n*3️⃣  الوحدة / الفوج / القسم:*\nأرسل اسم وحدتك 👇",
         parse_mode="Markdown",
@@ -243,7 +298,9 @@ async def badge_mil_num(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return BADGE_UNIT
 
 async def badge_unit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["b_unit"] = update.message.text
+    context.user_data["b_unit"] = get_msg_content(update.message)
+    if not update.message.text:
+        context.user_data.setdefault("media_msgs", []).append(update.message.message_id)
     await update.message.reply_text(
         "✅ تم.\n\n*4️⃣  ما هية المشكلة؟*\nاشرح مشكلتك بالتفصيل 👇",
         parse_mode="Markdown",
@@ -251,11 +308,16 @@ async def badge_unit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return BADGE_PROBLEM
 
 async def badge_problem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["b_prob"] = update.message.text
+    context.user_data["b_prob"] = get_msg_content(update.message)
+    if not update.message.text:
+        context.user_data.setdefault("media_msgs", []).append(update.message.message_id)
+    
     d = context.user_data
+    serial = get_next_serial()
 
     summary = (
-        f"✅ *تم استلام طلبك بنجاح!*\n\n"
+        f"✅ *تم استلام طلبك بنجاح!*\n"
+        f"🔖 *رقم الطلب:* `#{serial}`\n\n"
         f"📋 *ملخص طلب الباج (الهوية):*\n{DIVIDER}\n"
         f"👤 الاسم الثلاثي : {d.get('b_name')}\n"
         f"🔢 الرقم العسكري : {d.get('b_mil')}\n"
@@ -264,7 +326,7 @@ async def badge_problem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         f"{DIVIDER}\n📩 سيتم التواصل معك في أقرب وقت ممكن 🫡"
     )
     await update.message.reply_text(summary, reply_markup=kb_back(), parse_mode="Markdown")
-    await notify_admins(context, update.effective_user, summary)
+    await notify_admins(context, update.effective_user, summary, d.get("media_msgs"), serial)
     return MAIN_MENU
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -288,7 +350,9 @@ async def vauth_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return VA_NAME
 
 async def va_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["va_name"] = update.message.text
+    context.user_data["va_name"] = get_msg_content(update.message)
+    if not update.message.text:
+        context.user_data.setdefault("media_msgs", []).append(update.message.message_id)
     await update.message.reply_text(
         "✅ تم.\n\n*2️⃣  الرقم العسكري:*\nأرسل رقمك العسكري 👇",
         parse_mode="Markdown",
@@ -296,7 +360,9 @@ async def va_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return VA_MIL_NUM
 
 async def va_mil_num(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["va_mil"] = update.message.text
+    context.user_data["va_mil"] = get_msg_content(update.message)
+    if not update.message.text:
+        context.user_data.setdefault("media_msgs", []).append(update.message.message_id)
     await update.message.reply_text(
         "✅ تم.\n\n*3️⃣  الوحدة / الفوج / القسم:*\nأرسل اسم وحدتك 👇",
         parse_mode="Markdown",
@@ -304,7 +370,9 @@ async def va_mil_num(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return VA_UNIT
 
 async def va_unit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["va_unit"] = update.message.text
+    context.user_data["va_unit"] = get_msg_content(update.message)
+    if not update.message.text:
+        context.user_data.setdefault("media_msgs", []).append(update.message.message_id)
     await update.message.reply_text(
         "✅ تم.\n\n*4️⃣  ملاحظات إضافية / تفاصيل الطلب:*\nأضف أي تفاصيل 👇",
         parse_mode="Markdown",
@@ -312,11 +380,16 @@ async def va_unit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return VA_NOTES
 
 async def va_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["va_notes"] = update.message.text
+    context.user_data["va_notes"] = get_msg_content(update.message)
+    if not update.message.text:
+        context.user_data.setdefault("media_msgs", []).append(update.message.message_id)
+        
     d = context.user_data
+    serial = get_next_serial()
 
     summary = (
-        f"✅ *تم استلام طلبك بنجاح!*\n\n"
+        f"✅ *تم استلام طلبك بنجاح!*\n"
+        f"🔖 *رقم الطلب:* `#{serial}`\n\n"
         f"🚗 *ملخص طلب التخويل:*\n{DIVIDER}\n"
         f"📌 نوع الطلب : {d.get('va_type')}\n"
         f"👤 الاسم الثلاثي : {d.get('va_name')}\n"
@@ -326,14 +399,16 @@ async def va_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"{DIVIDER}\n📩 سيتم التواصل معك في أقرب وقت ممكن 🫡"
     )
     await update.message.reply_text(summary, reply_markup=kb_back(), parse_mode="Markdown")
-    await notify_admins(context, update.effective_user, summary)
+    await notify_admins(context, update.effective_user, summary, d.get("media_msgs"), serial)
     return MAIN_MENU
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # نموذج البرقيات
 # ═══════════════════════════════════════════════════════════════════════════════
 async def tg_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["tg_name"] = update.message.text
+    context.user_data["tg_name"] = get_msg_content(update.message)
+    if not update.message.text:
+        context.user_data.setdefault("media_msgs", []).append(update.message.message_id)
     await update.message.reply_text(
         "✅ تم.\n\n*2️⃣  نوع العجلة:*\nأرسل نوع العجلة 👇",
         parse_mode="Markdown",
@@ -341,7 +416,9 @@ async def tg_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return TG_VEH_TYPE
 
 async def tg_veh_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["tg_veh"] = update.message.text
+    context.user_data["tg_veh"] = get_msg_content(update.message)
+    if not update.message.text:
+        context.user_data.setdefault("media_msgs", []).append(update.message.message_id)
     await update.message.reply_text(
         "✅ تم.\n\n*3️⃣  اللون والموديل:*\nأرسل لون وموديل العجلة 👇",
         parse_mode="Markdown",
@@ -349,7 +426,9 @@ async def tg_veh_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return TG_COLOR
 
 async def tg_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["tg_color"] = update.message.text
+    context.user_data["tg_color"] = get_msg_content(update.message)
+    if not update.message.text:
+        context.user_data.setdefault("media_msgs", []).append(update.message.message_id)
     await update.message.reply_text(
         "✅ تم.\n\n*4️⃣  من وإلى:*\nأرسل الوجهة (من أين وإلى أين) 👇",
         parse_mode="Markdown",
@@ -357,7 +436,9 @@ async def tg_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return TG_FROM_TO
 
 async def tg_from_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["tg_route"] = update.message.text
+    context.user_data["tg_route"] = get_msg_content(update.message)
+    if not update.message.text:
+        context.user_data.setdefault("media_msgs", []).append(update.message.message_id)
     await update.message.reply_text(
         "✅ تم.\n\n*5️⃣  التاريخ:*\nأرسل تاريخ البرقية 👇",
         parse_mode="Markdown",
@@ -365,11 +446,16 @@ async def tg_from_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return TG_DATE
 
 async def tg_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["tg_date"] = update.message.text
+    context.user_data["tg_date"] = get_msg_content(update.message)
+    if not update.message.text:
+        context.user_data.setdefault("media_msgs", []).append(update.message.message_id)
+        
     d = context.user_data
+    serial = get_next_serial()
 
     summary = (
-        f"✅ *تم استلام البرقية بنجاح!*\n\n"
+        f"✅ *تم استلام البرقية بنجاح!*\n"
+        f"🔖 *رقم الطلب:* `#{serial}`\n\n"
         f"📨 *ملخص البرقية:*\n{DIVIDER}\n"
         f"👤 بأمرة (الاسم) : {d.get('tg_name')}\n"
         f"🚗 نوع العجلة : {d.get('tg_veh')}\n"
@@ -379,16 +465,20 @@ async def tg_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"{DIVIDER}\n📩 سيتم التواصل معك في أقرب وقت ممكن 🫡"
     )
     await update.message.reply_text(summary, reply_markup=kb_back(), parse_mode="Markdown")
-    await notify_admins(context, update.effective_user, summary)
+    await notify_admins(context, update.effective_user, summary, d.get("media_msgs"), serial)
     return MAIN_MENU
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # مقترح / مشكلة
 # ═══════════════════════════════════════════════════════════════════════════════
 async def suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text
+    text = get_msg_content(update.message)
+    media = [update.message.message_id] if not update.message.text else []
+    serial = get_next_serial()
+    
     await update.message.reply_text(
         f"✅ *شكراً لك!*\n\n"
+        f"🔖 *رقم الطلب:* `#{serial}`\n"
         f"💡 تم استلام مقترحك/مشكلتك وسيتم إيصالها للمسؤولين.\n"
         f"{DIVIDER}\n📩 سيتم التواصل معك في أقرب وقت ممكن 🫡",
         reply_markup=kb_back(),
@@ -398,6 +488,8 @@ async def suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         context,
         update.effective_user,
         f"💡 *مقترح / مشكلة:*\n{DIVIDER}\n{text}",
+        media,
+        serial
     )
     return MAIN_MENU
 
@@ -415,25 +507,30 @@ async def live_chat_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     في وضع المحادثة المباشرة: يُرسل كل ما يكتبه المستخدم إلى جميع الإدمنات.
     """
     user = update.effective_user
-    user_msg = update.message.text
     mention = f"@{user.username}" if user.username else user.first_name
+    serial = active_chats.get(user.id)
+    
+    serial_text = f" [طلب #{serial}]" if isinstance(serial, int) else ""
 
     admin_text = (
-        f"💬 *محادثة مباشرة* من {mention} (ID: `{user.id}`):\n"
-        f"{DIVIDER}\n\n"
-        f"{user_msg}\n\n"
-        f"{DIVIDER}\n"
-        f"↩️ _للرد، قم بالرد على هذه الرسالة (Reply)_\n"
-        f"🔚 _لإنهاء المحادثة: /end `{user.id}`_"
+        f"💬 *محادثة مباشرة{serial_text}* من {mention} (ID: `{user.id}`):\n"
+        f"↩️ _للرد، قم بالرد على هذه الرسالة (Reply)_ | 🔚 _لإنهاء المحادثة: /end `{user.id}`_"
     )
 
     admins = load_admins()
     for admin_id in admins:
         try:
-            sent = await context.bot.send_message(
+            sent_header = await context.bot.send_message(
                 chat_id=admin_id, text=admin_text, parse_mode="Markdown"
             )
-            message_to_user_map[(admin_id, sent.message_id)] = user.id
+            sent_copy = await context.bot.copy_message(
+                chat_id=admin_id,
+                from_chat_id=user.id,
+                message_id=update.message.message_id
+            )
+            # Both header and copy can be replied to by the admin
+            message_to_user_map[(admin_id, sent_header.message_id)] = (user.id, serial if isinstance(serial, int) else None)
+            message_to_user_map[(admin_id, sent_copy.message_id)] = (user.id, serial if isinstance(serial, int) else None)
         except Exception as e:
             logger.error(f"Live chat forward to admin {admin_id} failed: {e}")
 
@@ -638,21 +735,25 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = (admin_id, replied_msg_id)
 
     # ابحث عن المستخدم الأصلي
-    user_chat_id = message_to_user_map.get(key)
-    if not user_chat_id:
+    mapped = message_to_user_map.get(key)
+    if not mapped:
         return
+        
+    if isinstance(mapped, tuple):
+        user_chat_id, serial = mapped
+    else:
+        user_chat_id = mapped
+        serial = None
 
     # تفعيل المحادثة المباشرة للمستخدم
     is_new_chat = user_chat_id not in active_chats
-    active_chats[user_chat_id] = True
+    active_chats[user_chat_id] = serial if serial else True
 
     try:
         if is_new_chat:
-            # أول رد — أبلغ المستخدم أنه دخل في محادثة مباشرة
+            serial_text = f" [طلب #{serial}]" if serial else ""
             chat_start_text = (
-                f"📬 *رد من قسم الأمن:*\n{DIVIDER}\n\n"
-                f"{msg.text}\n\n"
-                f"{DIVIDER}\n"
+                f"📬 *تنبيه من قسم الأمن{serial_text}:*\n{DIVIDER}\n"
                 f"💬 *أنت الآن في محادثة مباشرة مع المسؤول*\n"
                 f"اكتب ردك مباشرة وسيصل للمسؤول فوراً 👇\n\n"
                 f"🔚 _لإنهاء المحادثة أرسل /end_"
@@ -661,15 +762,24 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=user_chat_id, text=chat_start_text,
                 parse_mode="Markdown", reply_markup=kb_end_chat(),
             )
+            
+        if msg.text:
+             await context.bot.send_message(
+                 chat_id=user_chat_id, 
+                 text=f"📬 *المسؤول:*\n{DIVIDER}\n\n{msg.text}", 
+                 parse_mode="Markdown"
+             )
         else:
-            # محادثة جارية — أرسل الرد فقط
-            reply_text = (
-                f"📬 *المسؤول:*\n{DIVIDER}\n\n"
-                f"{msg.text}"
-            )
-            await context.bot.send_message(
-                chat_id=user_chat_id, text=reply_text, parse_mode="Markdown",
-            )
+             await context.bot.send_message(
+                 chat_id=user_chat_id, 
+                 text=f"📬 *المسؤول (مرفق):*", 
+                 parse_mode="Markdown"
+             )
+             await context.bot.copy_message(
+                 chat_id=user_chat_id,
+                 from_chat_id=admin_id,
+                 message_id=msg.message_id
+             )
 
         await msg.reply_text("✅ تم إرسال ردك للمستخدم بنجاح.")
         logger.info(f"Admin {admin_id} replied to user {user_chat_id} (live_chat={not is_new_chat})")
@@ -686,10 +796,10 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    txt = filters.TEXT & ~filters.COMMAND
+    any_msg = filters.ALL & ~filters.COMMAND
 
     # ── معترض المحادثة المباشرة (مجموعة -1 ليعمل قبل ConversationHandler) ──
-    app.add_handler(MessageHandler(txt, intercept_live_chat), group=-1)
+    app.add_handler(MessageHandler(any_msg, intercept_live_chat), group=-1)
     app.add_handler(CallbackQueryHandler(end_chat_button, pattern=r"^end_chat$"), group=-1)
 
     conv = ConversationHandler(
@@ -700,26 +810,26 @@ def main() -> None:
                 CallbackQueryHandler(main_menu, pattern=r"^(badge|vauth|telegram|suggest|home)$")
             ],
             # ── الباج ──────────────────────────────────────────
-            BADGE_NAME:    [MessageHandler(txt, badge_name)],
-            BADGE_MIL_NUM: [MessageHandler(txt, badge_mil_num)],
-            BADGE_UNIT:    [MessageHandler(txt, badge_unit)],
-            BADGE_PROBLEM: [MessageHandler(txt, badge_problem)],
+            BADGE_NAME:    [MessageHandler(any_msg, badge_name)],
+            BADGE_MIL_NUM: [MessageHandler(any_msg, badge_mil_num)],
+            BADGE_UNIT:    [MessageHandler(any_msg, badge_unit)],
+            BADGE_PROBLEM: [MessageHandler(any_msg, badge_problem)],
             # ── التخويل ────────────────────────────────────────
             VEHICLE_AUTH_MENU: [
                 CallbackQueryHandler(vauth_menu, pattern=r"^(va_|home)")
             ],
-            VA_NAME:    [MessageHandler(txt, va_name)],
-            VA_MIL_NUM: [MessageHandler(txt, va_mil_num)],
-            VA_UNIT:    [MessageHandler(txt, va_unit)],
-            VA_NOTES:   [MessageHandler(txt, va_notes)],
+            VA_NAME:    [MessageHandler(any_msg, va_name)],
+            VA_MIL_NUM: [MessageHandler(any_msg, va_mil_num)],
+            VA_UNIT:    [MessageHandler(any_msg, va_unit)],
+            VA_NOTES:   [MessageHandler(any_msg, va_notes)],
             # ── البرقيات ───────────────────────────────────────
-            TG_NAME:     [MessageHandler(txt, tg_name)],
-            TG_VEH_TYPE: [MessageHandler(txt, tg_veh_type)],
-            TG_COLOR:    [MessageHandler(txt, tg_color)],
-            TG_FROM_TO:  [MessageHandler(txt, tg_from_to)],
-            TG_DATE:     [MessageHandler(txt, tg_date)],
+            TG_NAME:     [MessageHandler(any_msg, tg_name)],
+            TG_VEH_TYPE: [MessageHandler(any_msg, tg_veh_type)],
+            TG_COLOR:    [MessageHandler(any_msg, tg_color)],
+            TG_FROM_TO:  [MessageHandler(any_msg, tg_from_to)],
+            TG_DATE:     [MessageHandler(any_msg, tg_date)],
             # ── مقترح ──────────────────────────────────────────
-            SUGGESTION: [MessageHandler(txt, suggestion)],
+            SUGGESTION: [MessageHandler(any_msg, suggestion)],
         },
         fallbacks=[
             CommandHandler("start", start),
@@ -745,9 +855,9 @@ def main() -> None:
     app.add_handler(CommandHandler("myid", cmd_myid))
 
     # ── معالج رد الإدمن على المستخدم ──────────────────────────────────────
-    # يلتقط أي رسالة نصية تكون رداً (reply) من إدمن
+    # يلتقط أي رسالة تكون رداً (reply) من إدمن
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.REPLY,
+        filters.ALL & ~filters.COMMAND & filters.REPLY,
         admin_reply,
     ))
 
