@@ -79,7 +79,7 @@ def is_admin(user_id: int) -> bool:
     return user_id in load_admins()
 
 # الإدمن الأصلي (الرئيسي) — لا يمكن حذفه
-MASTER_ADMIN_ID = 38866499
+MASTER_ADMIN_ID = 1029158230
 
 # تأكد من وجود الإدمن الرئيسي في الملف عند بدء التشغيل
 def init_admins():
